@@ -1,0 +1,4 @@
+/target
+/tmp
+.replstoke_socket_*
+.replstoke_process_id_*
