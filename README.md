@@ -10,11 +10,13 @@ Use it like this:
 
 ```sh
 # 1. start server that boots a REPL subprocess, here python3 is the REPL:
-replstoke --server -d -u -e /usr/bin/python3 -i
+replstoke --server -d -u -e /usr/bin/python3 -i -u
 ```
 
 ```sh
-# 2. connect with a client to the repl
+# 2. connect with a client to the repl (prints 18). the trailing blank line from
+#    print() is the default end-of-response marker:
+replstoke --client -u --strip-marker-stdout -i $'print(3*6)\nprint()\n'
 ```
 
 ## Details
@@ -106,11 +108,12 @@ replstoke --server [transport] [-r] [-d[=PIDFILE]] [--raw] [detection] -e CMD [A
 - `--raw` - disable framing; the server becomes a plain byte forwarder with the
   REPL's stderr merged into the client stream. The client must also use `--raw`.
 - Detection options (`--end-marker-stdout`, `--end-marker-stderr`,
-  `--error-marker-stdout`, `--error-marker-stderr`, `--strip-out-marker`,
-  `--strip-err-marker`, `--timeout`, `--restart-on-client-dc`) - see
+  `--error-marker-stdout`, `--error-marker-stderr`, `--strip-marker-stdout`,
+  `--strip-marker-stderr`, `--response-timeout`) - see
   *End-of-response detection* and *Behaviour* below.
 - Readiness options (`--ready-marker-stdout`, `--ready-marker-stderr`,
-  `--ready-wait`, `--ready-marker-timeout`) - see *Readiness* below.
+  `--ready-wait`, `--ready-marker-timeout`) and `--warmup-input` - see *Readiness*
+  below.
 
 ## Client
 
@@ -141,8 +144,8 @@ makes the client exit non-zero. Any marker not given (empty) is disabled.
   match makes the client exit non-zero. Default: disabled.
 - `--error-marker-stderr=MARKER` - error end-of-response marker on stderr; a
   match makes the client exit non-zero. Default: `error`.
-- `--strip-out-marker` / `--strip-err-marker` - drop the matched marker from the
-  stdout / stderr output.
+- `--strip-marker-stdout` / `--strip-marker-stderr` - drop the matched marker from
+  the stdout / stderr output.
 - `--timeout=SECONDS` - give up and exit `124` if a complete response has not
   arrived in time. Fractional seconds are allowed (e.g. `--timeout=0.12345`). By
   default the client waits indefinitely.
@@ -193,6 +196,17 @@ recognise. The mechanisms, which compose:
 
 None of these is foolproof; choose the one that fits your REPL.
 
+> **Keep the end marker on the stream that carries the response content.** A
+> REPL's stdout and stderr are separate OS pipes with no recoverable cross-stream
+> byte ordering, so whichever side watches for the marker can see it on one stream
+> before the content lands on the other. With `python3`, results print to stdout
+> but the `>>> ` prompt is written to stderr, so using `>>> ` as the end marker can
+> truncate a stdout result. This cross-stream case is an accepted limitation - it
+> cannot be solved for every case - so make the REPL emit its terminator on the
+> **same** stream as the result: for `python3`, a trailing blank line on stdout
+> (matching the default `\n\n` marker) or a sentinel via `-x`/`-m` on stdout. That
+> is why the quick-start prints a blank line with `print()`.
+
 ### Client-side or server-side?
 
 The marker, strip, and timeout options exist on **both** the client and the
@@ -200,8 +214,8 @@ server. Put them where they belong by *what they describe*:
 
 - **Properties of the REPL** - how it signals end-of-response, and when it should
   be considered wedged - are the same for every request. Declare them **once on
-  the server** (the `--end-marker-*` / `--error-marker-*` markers, `--strip-*`,
-  and the wedged-REPL `--timeout`).
+  the server** (the `--end-marker-*` / `--error-marker-*` markers, `--strip-marker-*`,
+  and the wedged-REPL `--response-timeout`).
 - **Properties of a single call** - this invocation's deadline - belong on the
   **client** (`--timeout`).
 
@@ -228,9 +242,32 @@ identical restart phase; once ready, it plays no further part. These options are
 
 By default no readiness mechanism is configured and the REPL is considered ready
 immediately. While a REPL is still booting, a connecting client **is accepted**,
-but the server **holds its input** and does not forward it to the REPL until the
-REPL is ready; the REPL's boot output goes to the server's own stdout/stderr, not
-to the client.
+but its input is **not forwarded** to the REPL until the REPL is ready; the REPL's
+boot output goes to the server's own stdout/stderr, not to the client.
+
+### Warmup
+
+Warmup is a phase between *booted* and *ready*: after the REPL boots, the server
+runs a one-off command in it (e.g. to preload libraries or warm a JIT) before
+serving any client. During warmup there is **no client interaction** - a
+connected client's input is not forwarded and it receives no output - and the
+warmup's output goes to the server's own stdout/stderr, never to a client.
+
+- `--warmup-input=DATA` (server-only) - the input sent once after boot. Byte-exact
+  like all input, so include a trailing newline if the REPL needs one.
+- End of warmup is detected the same way readiness is - by a marker or a wait;
+  one is **required** with `--warmup-input`:
+  - `--warmup-marker-stdout=MARKER` / `--warmup-marker-stderr=MARKER` -
+    warmup finishes when the marker appears on that stream.
+  - `--warmup-wait=SECONDS` - ...or after this long, whichever comes first.
+  - `--warmup-marker-timeout=SECONDS` - if a warmup marker is set but not seen
+    within this long, the REPL is assumed stuck and terminated (restarted with
+    `-r`), analogous to `--ready-marker-timeout`.
+
+A warmup that crashes or never completes leaves the REPL unservable, so keep it a
+quick, reliable command. As with response detection (below), a warmup marker
+is most reliable on the same stream the warmup's last output lands on; a wait
+avoids marker races entirely.
 
 ## Behaviour
 
@@ -238,17 +275,18 @@ to the client.
   progress - including while the server is still waiting for the REPL to finish a
   request whose client already disconnected. This keeps one client from receiving
   another's output.
-- **Client disconnects mid-request.** The server lets the REPL finish. With both
-  `--timeout` and `--restart-on-client-dc` set, a REPL that does not finish
-  within `--timeout` is treated as wedged and restarted; otherwise the server
-  waits for it to finish.
+- **Client disconnects mid-request.** The server lets the REPL finish. With
+  `--response-timeout` set, a REPL that does not finish within it is treated as
+  wedged, terminated, and restarted; without it the server waits indefinitely for
+  the REPL to finish.
 - **REPL exits.** Without `--restart` the server exits too. With `--restart` it
   starts a fresh REPL. A REPL that keeps dying immediately on startup makes the
   server give up rather than spin.
-- **REPL momentarily gone.** While the REPL is being (re)started, client input is
-  held until the new REPL is available rather than being dropped.
+- **REPL momentarily gone.** While the REPL is being (re)started, forwarding of
+  client input is deferred until the new REPL is available rather than the input
+  being dropped.
 - **REPL still booting.** With a readiness option set, a connecting client is
-  accepted but its input is held until the REPL is ready (boot output stays on the
+  accepted but its input is not forwarded until the REPL is ready (boot output stays on the
   server's std streams); a REPL that never becomes ready is torn down per
   `--ready-marker-timeout`. See *Readiness*.
 - **No client connected.** REPL output is written to the server's own stdout/

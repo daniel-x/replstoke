@@ -136,7 +136,7 @@ fn strip_marker_removes_trailing_blank() {
     let out = client(&[
         "--client",
         &format!("--unixsocket={sock}"),
-        "--strip-out-marker",
+        "--strip-marker-stdout",
         "-i",
         "hi\n",
     ]);
@@ -150,14 +150,14 @@ fn strip_marker_removes_trailing_blank() {
 }
 
 #[test]
-fn server_side_strip_out_marker() {
-    // The server strips the out marker; the client disables its own markers and
+fn server_side_strip_marker_stdout() {
+    // The server strips the stdout marker; the client disables its own markers and
     // reads until its timeout, so we observe exactly what the server forwarded.
     let dir = tempdir("srvstrip");
     let sock = unix_sock(&dir);
     let _srv = spawn_server(&[
         "--server",
-        "--strip-out-marker",
+        "--strip-marker-stdout",
         &format!("--unixsocket={sock}"),
         "-e",
         dummyrepl().to_str().unwrap(),
@@ -558,6 +558,228 @@ fn startup_crash_loop_gives_up() {
 }
 
 #[test]
+fn warmup_runs_before_serving_and_is_not_leaked() {
+    let dir = tempdir("warmup");
+    let sock = unix_sock(&dir);
+    // The warmup defines a variable the client uses (proving it ran) and prints a
+    // sentinel (which must not reach the client). Warmup completion uses a wait;
+    // the response uses the default "\n\n" stdout marker on the same stream as the
+    // result, so no cross-stream end-marker race can truncate the response.
+    let _srv = spawn_server(&[
+        "--server",
+        &format!("--unixsocket={sock}"),
+        "--warmup-input",
+        "V = 42; print('__WARMED__')\n",
+        "--warmup-wait",
+        "0.4",
+        "-e",
+        "python3",
+        "-i",
+        "-u",
+    ]);
+    wait_for_socket(Path::new(&sock));
+
+    let out = client(&[
+        "--client",
+        &format!("--unixsocket={sock}"),
+        "--strip-marker-stdout",
+        "-i",
+        "print(V)\nprint()\n",
+    ]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "42",
+        "warmup var should be defined: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("__WARMED__"),
+        "warmup output must not leak to the client: {stdout:?}"
+    );
+}
+
+#[test]
+fn warmup_marker_timeout_kills_stuck_repl() {
+    let dir = tempdir("warmupstuck");
+    let sock = unix_sock(&dir);
+    // The REPL boots (via --ready-wait) but never emits the warmup marker. With no
+    // --restart, the server tears it down after the warmup-marker timeout and exits.
+    let script = dir.join("stuck.py");
+    std::fs::write(&script, "import time\ntime.sleep(60)\n").unwrap();
+
+    let mut srv = spawn_server(&[
+        "--server",
+        "--ready-wait",
+        "0.2",
+        "--warmup-input",
+        "warm\n",
+        "--warmup-marker-stdout",
+        "__WARMED__",
+        "--warmup-marker-timeout",
+        "1",
+        &format!("--unixsocket={sock}"),
+        "-e",
+        "python3",
+        "-u",
+        script.to_str().unwrap(),
+    ]);
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while srv.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        srv.child.try_wait().unwrap().is_some(),
+        "server should give up and exit after the warmup-marker timeout"
+    );
+}
+
+#[test]
+fn warmup_marker_timeout_restarts_repl() {
+    let dir = tempdir("warmuprestart");
+    let sock = unix_sock(&dir);
+    let counter = dir.join("attempts");
+    // First spawn never emits the warmup marker, so --warmup-marker-timeout kills
+    // it; with -r the server respawns. The second spawn completes its warmup and
+    // then serves one client request, proving the restart recovered.
+    let script = dir.join("flaky.py");
+    std::fs::write(
+        &script,
+        format!(
+            "import sys, time\n\
+             c = \"{counter}\"\n\
+             n = 0\n\
+             try:\n\
+             \x20   n = int(open(c).read().strip())\n\
+             except Exception:\n\
+             \x20   pass\n\
+             open(c, \"w\").write(str(n + 1))\n\
+             if n == 0:\n\
+             \x20   time.sleep(60)\n\
+             else:\n\
+             \x20   sys.stdin.readline()\n\
+             \x20   sys.stdout.write(\"__WARMED__\\n\")\n\
+             \x20   sys.stdout.flush()\n\
+             \x20   line = sys.stdin.readline()\n\
+             \x20   sys.stdout.write(\"ok=\" + line.strip() + \"\\n\\n\")\n\
+             \x20   sys.stdout.flush()\n",
+            counter = counter.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let _srv = spawn_server(&[
+        "--server",
+        "-r",
+        "--ready-wait",
+        "0.2",
+        "--warmup-input",
+        "warm\n",
+        "--warmup-marker-stdout",
+        "__WARMED__",
+        "--warmup-marker-timeout",
+        "1",
+        &format!("--unixsocket={sock}"),
+        "-e",
+        "python3",
+        "-u",
+        script.to_str().unwrap(),
+    ]);
+    wait_for_socket(Path::new(&sock));
+
+    // Wait until the second spawn has started (proves the stuck one was killed and
+    // restarted), then a client request must succeed against the recovered REPL.
+    let attempts = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while attempts() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        attempts() >= 2,
+        "stuck REPL should have been killed and restarted (attempts={})",
+        attempts()
+    );
+
+    let out = client(&["--client", &format!("--unixsocket={sock}"), "-i", "b\n"]);
+    assert!(
+        out.status.success(),
+        "request after warmup restart failed: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("ok=b"),
+        "recovered REPL should answer the request: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn trailing_output_after_server_marker_reaches_client() {
+    // The server's end marker is on stderr; the REPL emits that marker *first*,
+    // then (after a delay) the real result on stdout. The server therefore sees its
+    // end marker and goes Idle before the stdout arrives. The result must still be
+    // forwarded to the still-connected client: the server's marker only governs
+    // when the next client may be served, never when to stop feeding this one. The
+    // client ends on its own stdout sentinel.
+    let dir = tempdir("trailing");
+    let sock = unix_sock(&dir);
+    let script = dir.join("split.py");
+    std::fs::write(
+        &script,
+        "import sys, time\n\
+         for line in sys.stdin:\n\
+         \x20   sys.stderr.write('>>> ')\n\
+         \x20   sys.stderr.flush()\n\
+         \x20   time.sleep(0.2)\n\
+         \x20   sys.stdout.write('RESULT_' + line.strip() + '\\n__CDONE__\\n')\n\
+         \x20   sys.stdout.flush()\n",
+    )
+    .unwrap();
+
+    let _srv = spawn_server(&[
+        "--server",
+        &format!("--unixsocket={sock}"),
+        "--end-marker-stdout=",
+        "--end-marker-stderr=>>> ",
+        "--error-marker-stdout=",
+        "--error-marker-stderr=",
+        "-e",
+        "python3",
+        "-u",
+        script.to_str().unwrap(),
+    ]);
+    wait_for_socket(Path::new(&sock));
+
+    let out = client(&[
+        "--client",
+        &format!("--unixsocket={sock}"),
+        "--end-marker-stdout=__CDONE__",
+        "--end-marker-stderr=",
+        "--error-marker-stdout=",
+        "--error-marker-stderr=",
+        "--timeout=5",
+        "-i",
+        "abc\n",
+    ]);
+    assert!(
+        out.status.success(),
+        "client should complete, not time out: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("RESULT_abc"),
+        "trailing stdout after the server's stderr marker must reach the client: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn ready_wait_then_serves() {
     let dir = tempdir("readywait");
     let sock = unix_sock(&dir);
@@ -572,8 +794,8 @@ fn ready_wait_then_serves() {
     ]);
     wait_for_socket(Path::new(&sock));
 
-    // The client connects during boot; the server accepts it and holds its input
-    // until --ready-wait elapses, then serves it. A single attempt succeeds.
+    // The client connects during boot; the server accepts it and defers forwarding
+    // its input until --ready-wait elapses, then serves it. A single attempt succeeds.
     let out = client(&["--client", &format!("--unixsocket={sock}"), "-i", "hi\n"]);
     assert!(out.status.success(), "should serve after --ready-wait");
     assert!(String::from_utf8_lossy(&out.stdout).contains("input_from_client=hi"));
@@ -604,7 +826,7 @@ fn ready_marker_then_serves() {
 }
 
 #[test]
-fn booting_repl_holds_input_and_hides_boot_output() {
+fn booting_repl_defers_input_and_hides_boot_output() {
     let dir = tempdir("readyhold");
     let sock = unix_sock(&dir);
     // A REPL that boots slowly: it prints a banner to stdout, then its ready
@@ -633,12 +855,12 @@ fn booting_repl_holds_input_and_hides_boot_output() {
     ]);
     wait_for_socket(Path::new(&sock));
 
-    // Connect immediately (during boot). The server accepts and holds the input
-    // until the REPL is ready, then serves it.
+    // Connect immediately (during boot). The server accepts and defers forwarding
+    // the input until the REPL is ready, then serves it.
     let out = client(&["--client", &format!("--unixsocket={sock}"), "-i", "hi\n"]);
     assert!(
         out.status.success(),
-        "held input should be served after boot"
+        "deferred input should be served after boot"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("echo=hi"), "got: {stdout:?}");

@@ -62,9 +62,9 @@ pub struct ServerConfig {
     /// Error end-of-response marker watched on stderr; empty disables it.
     pub error_marker_stderr: Vec<u8>,
     /// Strip the matched marker from the stdout stream forwarded to the client.
-    pub strip_out_marker: bool,
+    pub strip_marker_stdout: bool,
     /// Strip the matched marker from the stderr stream forwarded to the client.
-    pub strip_err_marker: bool,
+    pub strip_marker_stderr: bool,
     /// Ready marker watched on stdout during the REPL's boot (start/restart)
     /// phase; empty disables it. The REPL is served to clients only once ready.
     pub ready_marker_stdout: Vec<u8>,
@@ -78,12 +78,23 @@ pub struct ServerConfig {
     /// assumed stuck and terminated (restarted when `restart` is set). Requires a
     /// ready marker.
     pub ready_marker_timeout: Option<Duration>,
+    /// Input written to the REPL once it has booted, before any client is served
+    /// (e.g. to preload libraries). Its output is not forwarded to clients, and no
+    /// client is served until it completes. Empty disables it.
+    pub warmup: Vec<u8>,
+    /// Marker on stdout that signals the warmup finished; empty disables it.
+    pub warmup_marker_stdout: Vec<u8>,
+    /// Marker on stderr that signals the warmup finished; empty disables it.
+    pub warmup_marker_stderr: Vec<u8>,
+    /// Fixed time to wait during warmup before treating it as finished, regardless
+    /// of markers. The warmup ends at the earliest of a marker match or this wait.
+    pub warmup_wait: Option<Duration>,
+    /// If no warmup marker is seen within this long, the REPL is assumed stuck and
+    /// terminated (restarted when `restart` is set). Requires a warmup marker.
+    pub warmup_marker_timeout: Option<Duration>,
     /// After a client disconnects mid-request, how long to wait for the REPL to
-    /// finish before considering it wedged. `None` waits indefinitely.
-    pub timeout: Option<Duration>,
-    /// If a client disconnects before the REPL responded and the REPL then fails
-    /// to finish within `timeout`, restart the REPL.
-    pub restart_on_client_dc: bool,
+    /// finish before terminating (and restarting) it. `None` waits indefinitely.
+    pub response_timeout: Option<Duration>,
 }
 
 /// Where the client routes the server's `ctl` status messages.
@@ -116,9 +127,9 @@ pub struct ClientConfig {
     /// Error end-of-response marker watched on stderr; empty disables it.
     pub error_marker_stderr: Vec<u8>,
     /// Strip the matched marker from the stdout stream output.
-    pub strip_out_marker: bool,
+    pub strip_marker_stdout: bool,
     /// Strip the matched marker from the stderr stream output.
-    pub strip_err_marker: bool,
+    pub strip_marker_stderr: bool,
     /// Where to route the server's ctl status messages.
     pub ctl: CtlRoute,
     /// Disable the framed protocol (plain byte reader, stderr merged into stdout).

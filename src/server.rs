@@ -57,8 +57,12 @@ struct ClientConn {
 #[derive(Clone, Copy, Debug)]
 enum Phase {
     /// REPL spawned, not yet ready. A client may be attached but its input is
-    /// held until the REPL becomes ready.
+    /// not forwarded until the REPL becomes ready.
     Booting { since: Instant },
+    /// Booted, running the one-shot `--warmup-input` before serving clients. A
+    /// client may be attached but its input is not forwarded; the warmup's output goes to
+    /// the server, not the client. `since` bounds the optional warmup timeout.
+    Warmup { since: Instant },
     /// Ready, no request in flight (a client may or may not be attached).
     Idle,
     /// A request's input was forwarded; awaiting an end-of-response marker.
@@ -80,15 +84,27 @@ struct Core {
     served: bool,
     requests: u64,
     next_gen: u64,
+    /// Incremented each time a request begins (Idle -> Busy). A pump uses it to
+    /// reset its response scanner cleanly at every request boundary, so one
+    /// response's held-back partial-marker bytes never bleed into the next.
+    req_seq: u64,
+    /// True from the connected client's first request until it disconnects. REPL
+    /// output is forwarded to that client for the whole span, so a response is not
+    /// truncated when the server's own end marker fires (Busy -> Idle) while more
+    /// output is still in flight on the other stream. The end marker only decides
+    /// when the *next* client may be served, never when to stop feeding this one.
+    serving: bool,
 }
 
 impl Core {
-    fn new(ready: bool, now: Instant) -> Core {
+    fn new(ready: bool, has_warmup: bool, now: Instant) -> Core {
         Core {
-            phase: initial_phase(ready, now),
+            phase: initial_phase(ready, has_warmup, now),
             served: false,
             requests: 0,
             next_gen: 1,
+            req_seq: 0,
+            serving: false,
         }
     }
 
@@ -96,11 +112,20 @@ impl Core {
         matches!(self.phase, Phase::Booting { .. })
     }
 
+    /// The REPL is not yet servable: still booting or running its warmup. Client
+    /// input is not forwarded and REPL output is withheld from the client in both.
+    fn is_pre_serving(&self) -> bool {
+        matches!(self.phase, Phase::Booting { .. } | Phase::Warmup { .. })
+    }
+
     /// Accept gate. `has_sink` is whether a client sink is already stored. Accepts
     /// only when no client is attached and the REPL is not mid-request. On success
     /// bumps the counters and returns the new client generation.
     fn try_accept(&mut self, has_sink: bool) -> Option<u64> {
-        let acceptable = matches!(self.phase, Phase::Booting { .. } | Phase::Idle);
+        let acceptable = matches!(
+            self.phase,
+            Phase::Booting { .. } | Phase::Warmup { .. } | Phase::Idle
+        );
         if has_sink || !acceptable {
             return None;
         }
@@ -108,15 +133,22 @@ impl Core {
         self.next_gen += 1;
         self.requests += 1;
         self.served = true;
+        self.serving = false;
         Some(gen)
     }
 
     /// A request's first input was forwarded: Idle -> Busy. Framed mode only; raw
     /// mode has no end-of-response marker, so it never becomes Busy (which would
-    /// never clear).
+    /// never clear). Marks the client as being served for the rest of its
+    /// connection, so trailing output is not cut when the end marker fires.
     fn request_start(&mut self, protocol: bool) {
-        if protocol && matches!(self.phase, Phase::Idle) {
+        if !protocol {
+            return;
+        }
+        self.serving = true;
+        if matches!(self.phase, Phase::Idle) {
             self.phase = Phase::Busy;
+            self.req_seq += 1;
         }
     }
 
@@ -130,15 +162,32 @@ impl Core {
     /// The active client departed. Busy -> Draining (arming `deadline`); in any
     /// other phase the phase is unchanged (the sink is cleared by the caller).
     fn client_gone(&mut self, deadline: Option<Instant>) {
+        self.serving = false;
         if matches!(self.phase, Phase::Busy) {
             self.phase = Phase::Draining { deadline };
         }
     }
 
-    /// The REPL became ready: Booting -> Idle. Returns whether it transitioned
-    /// (so the caller notifies waiters).
-    fn ready(&mut self) -> bool {
+    /// The REPL finished booting. With a warmup configured it enters Warmup;
+    /// otherwise it is Idle and servable. Returns whether it transitioned (so the
+    /// caller notifies waiters).
+    fn ready(&mut self, has_warmup: bool, now: Instant) -> bool {
         if self.is_booting() {
+            self.phase = if has_warmup {
+                Phase::Warmup { since: now }
+            } else {
+                Phase::Idle
+            };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The warmup finished: Warmup -> Idle. Returns whether it transitioned (so the
+    /// caller notifies waiters).
+    fn warmup_done(&mut self) -> bool {
+        if matches!(self.phase, Phase::Warmup { .. }) {
             self.phase = Phase::Idle;
             true
         } else {
@@ -146,10 +195,11 @@ impl Core {
         }
     }
 
-    /// A freshly (re)spawned REPL instance begins its boot phase.
-    fn begin_booting(&mut self, ready: bool, now: Instant) {
-        self.phase = initial_phase(ready, now);
+    /// A freshly (re)spawned REPL instance begins its lifecycle.
+    fn begin_booting(&mut self, ready: bool, has_warmup: bool, now: Instant) {
+        self.phase = initial_phase(ready, has_warmup, now);
         self.served = false;
+        self.serving = false;
     }
 
     fn stop(&mut self) {
@@ -157,13 +207,16 @@ impl Core {
     }
 }
 
-/// A REPL with no readiness mechanism configured is ready (Idle) immediately;
-/// otherwise it starts Booting.
-fn initial_phase(ready: bool, now: Instant) -> Phase {
-    if ready {
-        Phase::Idle
-    } else {
+/// The phase a freshly (re)spawned REPL starts in: Booting while a readiness
+/// mechanism is pending; else Warmup if a warmup is configured; else immediately
+/// servable (Idle).
+fn initial_phase(ready: bool, has_warmup: bool, now: Instant) -> Phase {
+    if !ready {
         Phase::Booting { since: now }
+    } else if has_warmup {
+        Phase::Warmup { since: now }
+    } else {
+        Phase::Idle
     }
 }
 
@@ -178,6 +231,16 @@ struct Shared {
     shutdown: AtomicBool,
     /// Whether a (re)spawned REPL is ready immediately (no readiness mechanism).
     initial_ready: bool,
+    /// Input run once after the REPL boots, before serving clients; empty disables
+    /// the warmup phase.
+    warmup: Vec<u8>,
+    /// End-of-warmup markers watched during Warmup (per stream); empty disables.
+    warmup_marker_stdout: Vec<u8>,
+    warmup_marker_stderr: Vec<u8>,
+    /// Whether this REPL instance's warmup input has been written. Warmup cannot
+    /// complete before it is sent, so boot output seen before it cannot end the
+    /// warmup prematurely.
+    warmup_sent: AtomicBool,
     protocol: bool,
     end_marker_stdout: Vec<u8>,
     end_marker_stderr: Vec<u8>,
@@ -187,8 +250,7 @@ struct Shared {
     ready_marker_stderr: Vec<u8>,
     strip_out: bool,
     strip_err: bool,
-    timeout: Option<Duration>,
-    restart_on_client_dc: bool,
+    response_timeout: Option<Duration>,
     start: Instant,
     started_at: String,
     server_pid: u32,
@@ -204,12 +266,27 @@ impl Shared {
         self.core.lock().unwrap().phase
     }
 
+    /// Phase plus whether a connected client is currently being served, snapshotted
+    /// together so a pump routes output consistently.
+    fn phase_and_serving(&self) -> (Phase, bool) {
+        let core = self.core.lock().unwrap();
+        (core.phase, core.serving)
+    }
+
     fn is_booting(&self) -> bool {
         self.core.lock().unwrap().is_booting()
     }
 
     fn served(&self) -> bool {
         self.core.lock().unwrap().served
+    }
+
+    fn req_seq(&self) -> u64 {
+        self.core.lock().unwrap().req_seq
+    }
+
+    fn has_warmup(&self) -> bool {
+        !self.warmup.is_empty()
     }
 
     // ---- transitions (lock Core briefly, then notify; never do I/O here) ------
@@ -222,19 +299,58 @@ impl Shared {
         self.core.lock().unwrap().response_end();
     }
 
-    /// The REPL became ready; wake anything parked waiting to forward input.
+    /// The REPL became ready; move to Warmup or Idle and wake anything parked
+    /// waiting to forward input.
     fn signal_ready(&self) {
-        if self.core.lock().unwrap().ready() {
+        if self
+            .core
+            .lock()
+            .unwrap()
+            .ready(self.has_warmup(), Instant::now())
+        {
             self.cv.notify_all();
         }
     }
 
+    /// The warmup finished; the REPL is now servable. Ignored until the warmup has
+    /// actually been sent, so a pre-warmup (startup) prompt cannot end it early.
+    fn warmup_done(&self) {
+        if !self.warmup_sent.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.core.lock().unwrap().warmup_done() {
+            self.cv.notify_all();
+        }
+    }
+
+    fn warmup_is_sent(&self) -> bool {
+        self.warmup_sent.load(Ordering::SeqCst)
+    }
+
+    /// Write the warmup input to the REPL's stdin (outside the Core lock), then
+    /// mark it sent. The flag is set only *after* the bytes are in the pipe, so a
+    /// deferred client's input (forwarded once warmup completes) can never overtake
+    /// the warmup in the REPL's stdin. Best-effort: a dead REPL is caught by the
+    /// supervisor's exit handling.
+    fn send_warmup(&self) {
+        {
+            let mut stdin = self.repl_stdin.lock().unwrap();
+            if let Some(w) = stdin.as_mut() {
+                let _ = w.write_all(&self.warmup);
+                let _ = w.flush();
+            }
+        }
+        self.warmup_sent.store(true, Ordering::SeqCst);
+    }
+
     /// Begin a fresh boot phase after a (re)spawn.
     fn begin_booting(&self) {
-        self.core
-            .lock()
-            .unwrap()
-            .begin_booting(self.initial_ready, Instant::now());
+        self.warmup_sent.store(false, Ordering::SeqCst);
+        self.core.lock().unwrap().begin_booting(
+            self.initial_ready,
+            self.has_warmup(),
+            Instant::now(),
+        );
         self.cv.notify_all();
     }
 
@@ -248,11 +364,7 @@ impl Shared {
     /// mid-request, transition to Draining. Locks Core before sink to keep the one
     /// consistent lock order (Core -> sink).
     fn client_gone(&self, gen: u64) {
-        let deadline = if self.restart_on_client_dc {
-            self.timeout.map(|t| Instant::now() + t)
-        } else {
-            None
-        };
+        let deadline = self.response_timeout.map(|t| Instant::now() + t);
         let mut core = self.core.lock().unwrap();
         {
             let mut sink = self.sink.lock().unwrap();
@@ -364,7 +476,7 @@ impl Shared {
     /// data is pulled into userspace until the REPL can process it.
     fn wait_until_ready(&self) -> bool {
         let mut core = self.core.lock().unwrap();
-        while core.is_booting() && !self.should_stop() {
+        while core.is_pre_serving() && !self.should_stop() {
             let (g, _) = self.cv.wait_timeout(core, POLL).unwrap();
             core = g;
         }
@@ -431,12 +543,16 @@ pub fn run(cfg: ServerConfig) -> AppResult<()> {
 
     let start = Instant::now();
     let shared = Arc::new(Shared {
-        core: Mutex::new(Core::new(initial_ready, start)),
+        core: Mutex::new(Core::new(initial_ready, !cfg.warmup.is_empty(), start)),
         cv: Condvar::new(),
         sink: Mutex::new(None),
         repl_stdin: Mutex::new(None),
         shutdown: AtomicBool::new(false),
         initial_ready,
+        warmup: cfg.warmup.clone(),
+        warmup_marker_stdout: cfg.warmup_marker_stdout.clone(),
+        warmup_marker_stderr: cfg.warmup_marker_stderr.clone(),
+        warmup_sent: AtomicBool::new(false),
         protocol: !cfg.raw,
         end_marker_stdout: cfg.end_marker_stdout.clone(),
         end_marker_stderr: cfg.end_marker_stderr.clone(),
@@ -444,10 +560,9 @@ pub fn run(cfg: ServerConfig) -> AppResult<()> {
         error_marker_stderr: cfg.error_marker_stderr.clone(),
         ready_marker_stdout: cfg.ready_marker_stdout.clone(),
         ready_marker_stderr: cfg.ready_marker_stderr.clone(),
-        strip_out: cfg.strip_out_marker,
-        strip_err: cfg.strip_err_marker,
-        timeout: cfg.timeout,
-        restart_on_client_dc: cfg.restart_on_client_dc,
+        strip_out: cfg.strip_marker_stdout,
+        strip_err: cfg.strip_marker_stderr,
+        response_timeout: cfg.response_timeout,
         start,
         started_at: format_utc_now(),
         server_pid: pid,
@@ -477,6 +592,21 @@ pub fn run(cfg: ServerConfig) -> AppResult<()> {
                         shared.signal_ready();
                     }
                 } else if let Some(t) = cfg.ready_marker_timeout {
+                    if !stuck && since.elapsed() >= t {
+                        stuck = true;
+                        guard.terminate();
+                    }
+                }
+            }
+            // The REPL just booted: run the warmup once, then end it when the
+            // warmup wait elapses (if no marker arrives first), or kill the REPL if
+            // its warmup marker fails to appear within the marker timeout.
+            Phase::Warmup { since } => {
+                if !shared.warmup_is_sent() {
+                    shared.send_warmup();
+                } else if cfg.warmup_wait.map_or(false, |t| since.elapsed() >= t) {
+                    shared.warmup_done();
+                } else if let Some(t) = cfg.warmup_marker_timeout {
                     if !stuck && since.elapsed() >= t {
                         stuck = true;
                         guard.terminate();
@@ -577,8 +707,8 @@ fn wire_repl(
 fn handle_connection(conn: Stream, shared: &Arc<Shared>, repl_pid: u32) {
     // Accept-gate and register the sink atomically (Core -> sink lock order) so
     // two racing connections cannot both pass the single-client gate. A client
-    // that connects while the REPL is still booting IS accepted; its input is
-    // held (see wait_until_ready) until the REPL is ready.
+    // that connects while the REPL is still booting IS accepted; forwarding of
+    // its input is deferred (see wait_until_ready) until the REPL is ready.
     let gen = {
         let mut core = shared.core.lock().unwrap();
         let mut sink = shared.sink.lock().unwrap();
@@ -635,68 +765,151 @@ fn spawn_repl_io(
 }
 
 fn pump(mut src: impl Read, shared: &Shared, is_err: bool) {
-    // Boot phase: watch this stream for the ready marker. It only observes bytes,
-    // never altering them; the REPL's boot output is forwarded to the server's own
-    // std streams (never the client).
-    let ready_marker = if is_err {
-        shared.ready_marker_stderr.clone()
-    } else {
-        shared.ready_marker_stdout.clone()
-    };
-    let mut ready_scanner = (!ready_marker.is_empty())
-        .then(|| MarkerScanner::new(Markers::new(vec![(ready_marker, Outcome::End)]), false));
+    // Single-shot per-stream detectors that only observe bytes: `ready_scanner`
+    // for the boot phase, `warmup_scanner` for the warmup phase.
+    let mut ready_scanner = ready_scanner_for(shared, is_err);
+    let mut warmup_scanner = warmup_scanner_for(shared, is_err);
 
-    // The response scanner (framed mode only) starts fresh once the REPL is ready,
-    // so no boot output ever enters it. Raw mode is a plain byte forwarder.
-    let mut scanner = shared.protocol.then(|| {
-        let (markers, strip) = if is_err {
-            (
-                Markers::new(vec![
-                    (shared.end_marker_stderr.clone(), Outcome::End),
-                    (shared.error_marker_stderr.clone(), Outcome::Error),
-                ]),
-                shared.strip_err,
-            )
-        } else {
-            (
-                Markers::new(vec![
-                    (shared.end_marker_stdout.clone(), Outcome::End),
-                    (shared.error_marker_stdout.clone(), Outcome::Error),
-                ]),
-                shared.strip_out,
-            )
-        };
-        ResponseScanner::new(markers, strip)
-    });
+    // Raw mode: plain forwarder. Boot and warmup output go to the server's own std
+    // streams; once servable, output goes to the connected client.
+    if !shared.protocol {
+        let mut buf = vec![0u8; BUF];
+        loop {
+            let n = match src.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            match shared.phase() {
+                Phase::Booting { .. } => {
+                    detect_ready(shared, &mut ready_scanner, &buf[..n]);
+                    deliver_repl_output(shared, is_err, &buf[..n], false);
+                }
+                Phase::Warmup { .. } => {
+                    detect_warmup(shared, &mut warmup_scanner, &buf[..n]);
+                    deliver_repl_output(shared, is_err, &buf[..n], false);
+                }
+                _ => deliver_repl_output(shared, is_err, &buf[..n], true),
+            }
+        }
+        return;
+    }
 
+    // Framed mode. The response scanner is fed only while a request is in flight
+    // (Busy/Draining) and is reset fresh at each request start. Everything before
+    // the request - boot, warmup, and idle output - is routed to the server's own
+    // std streams, so nothing (including warmup output arriving on a separate
+    // thread that may race the phase flip) can bleed into a client's response.
+    let mut scanner = response_scanner_for(shared, is_err);
+    // The request this pump's scanner is currently scanning; 0 = none. When the
+    // live request advances, the scanner is reset so the previous response's
+    // held-back bytes are flushed to the server rather than leaking to the next.
+    let mut scanned_seq = 0u64;
     let mut buf = vec![0u8; BUF];
     loop {
         let n = match src.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        // While booting, hold response detection and route to the server's std
-        // streams, not the client.
-        if shared.is_booting() {
-            detect_ready(shared, &mut ready_scanner, &buf[..n]);
-            deliver_repl_output(shared, is_err, &buf[..n], false);
-            continue;
-        }
-        match scanner.as_mut() {
-            Some(s) => {
-                let (emit, boundaries) = s.feed(&buf[..n]);
-                deliver_repl_output(shared, is_err, &emit, true);
-                if boundaries > 0 {
-                    shared.response_end();
+        let (phase, serving) = shared.phase_and_serving();
+        match phase {
+            Phase::Booting { .. } => {
+                detect_ready(shared, &mut ready_scanner, &buf[..n]);
+                deliver_repl_output(shared, is_err, &buf[..n], false);
+            }
+            Phase::Warmup { .. } => {
+                detect_warmup(shared, &mut warmup_scanner, &buf[..n]);
+                deliver_repl_output(shared, is_err, &buf[..n], false);
+            }
+            // Between the served client's requests (its end marker has fired) the
+            // REPL may still be flushing the tail of the response on the other
+            // stream: keep forwarding it to that client. Only remnants seen while no
+            // client is being served (a boot/warmup leftover, or after the client
+            // left) go to the server, so nothing bleeds into the next client.
+            Phase::Idle => {
+                deliver_repl_output(shared, is_err, &buf[..n], serving);
+            }
+            Phase::Stopped => {
+                deliver_repl_output(shared, is_err, &buf[..n], false);
+            }
+            // A request is in flight: scan the response and deliver it to the
+            // client, resetting the scanner cleanly at each new request boundary.
+            Phase::Busy | Phase::Draining { .. } => {
+                let seq = shared.req_seq();
+                if seq != scanned_seq {
+                    if let Some(s) = scanner.take() {
+                        let rest = s.flush();
+                        deliver_repl_output(shared, is_err, &rest, false);
+                    }
+                    scanner = response_scanner_for(shared, is_err);
+                    scanned_seq = seq;
+                }
+                if let Some(s) = scanner.as_mut() {
+                    let (emit, boundaries) = s.feed(&buf[..n]);
+                    deliver_repl_output(shared, is_err, &emit, true);
+                    if boundaries > 0 {
+                        shared.response_end();
+                    }
+                } else {
+                    deliver_repl_output(shared, is_err, &buf[..n], true);
                 }
             }
-            None => deliver_repl_output(shared, is_err, &buf[..n], true),
         }
     }
     if let Some(s) = scanner {
         let rest = s.flush();
-        deliver_repl_output(shared, is_err, &rest, true);
+        deliver_repl_output(shared, is_err, &rest, false);
     }
+}
+
+/// Build a single-shot marker scanner for one stream, or `None` if `marker` is
+/// empty (disabled).
+fn single_marker_scanner(marker: Vec<u8>) -> Option<MarkerScanner> {
+    (!marker.is_empty())
+        .then(|| MarkerScanner::new(Markers::new(vec![(marker, Outcome::End)]), false))
+}
+
+fn ready_scanner_for(shared: &Shared, is_err: bool) -> Option<MarkerScanner> {
+    let marker = if is_err {
+        shared.ready_marker_stderr.clone()
+    } else {
+        shared.ready_marker_stdout.clone()
+    };
+    single_marker_scanner(marker)
+}
+
+fn warmup_scanner_for(shared: &Shared, is_err: bool) -> Option<MarkerScanner> {
+    let marker = if is_err {
+        shared.warmup_marker_stderr.clone()
+    } else {
+        shared.warmup_marker_stdout.clone()
+    };
+    single_marker_scanner(marker)
+}
+
+/// Build the continuous end-of-response scanner for one stream (framed mode
+/// only; raw mode is a plain forwarder).
+fn response_scanner_for(shared: &Shared, is_err: bool) -> Option<ResponseScanner> {
+    if !shared.protocol {
+        return None;
+    }
+    let (markers, strip) = if is_err {
+        (
+            Markers::new(vec![
+                (shared.end_marker_stderr.clone(), Outcome::End),
+                (shared.error_marker_stderr.clone(), Outcome::Error),
+            ]),
+            shared.strip_err,
+        )
+    } else {
+        (
+            Markers::new(vec![
+                (shared.end_marker_stdout.clone(), Outcome::End),
+                (shared.error_marker_stdout.clone(), Outcome::Error),
+            ]),
+            shared.strip_out,
+        )
+    };
+    Some(ResponseScanner::new(markers, strip))
 }
 
 /// Watch a boot-phase chunk for the ready marker. Once the REPL is ready (via
@@ -714,6 +927,20 @@ fn detect_ready(shared: &Shared, ready_scanner: &mut Option<MarkerScanner>, chun
         if let Feed::Done { .. } = rs.feed(chunk) {
             shared.signal_ready();
             *ready_scanner = None;
+        }
+    }
+}
+
+/// Watch a warmup-phase chunk for the warmup end marker. Only scans once the
+/// warmup input has been sent, so boot output seen beforehand cannot match early.
+fn detect_warmup(shared: &Shared, warmup_scanner: &mut Option<MarkerScanner>, chunk: &[u8]) {
+    if warmup_scanner.is_none() || !shared.warmup_is_sent() {
+        return;
+    }
+    if let Some(ws) = warmup_scanner.as_mut() {
+        if let Feed::Done { .. } = ws.feed(chunk) {
+            shared.warmup_done();
+            *warmup_scanner = None;
         }
     }
 }
@@ -875,7 +1102,7 @@ mod tests {
 
     #[test]
     fn idle_accepts_then_rejects_second() {
-        let mut c = Core::new(true, now());
+        let mut c = Core::new(true, false, now());
         assert!(matches!(c.phase, Phase::Idle));
         assert_eq!(c.try_accept(false), Some(1));
         assert!(c.served);
@@ -886,7 +1113,7 @@ mod tests {
 
     #[test]
     fn booting_accepts_but_stays_booting() {
-        let mut c = Core::new(false, now());
+        let mut c = Core::new(false, false, now());
         assert!(c.is_booting());
         assert!(c.try_accept(false).is_some());
         assert!(
@@ -897,7 +1124,7 @@ mod tests {
 
     #[test]
     fn request_response_cycle() {
-        let mut c = Core::new(true, now());
+        let mut c = Core::new(true, false, now());
         c.request_start(true);
         assert!(matches!(c.phase, Phase::Busy));
         c.response_end();
@@ -906,14 +1133,14 @@ mod tests {
 
     #[test]
     fn raw_mode_never_busy() {
-        let mut c = Core::new(true, now());
+        let mut c = Core::new(true, false, now());
         c.request_start(false);
         assert!(matches!(c.phase, Phase::Idle));
     }
 
     #[test]
     fn client_gone_while_busy_drains_and_blocks() {
-        let mut c = Core::new(true, now());
+        let mut c = Core::new(true, false, now());
         c.request_start(true);
         c.client_gone(Some(now()));
         assert!(matches!(c.phase, Phase::Draining { deadline: Some(_) }));
@@ -926,25 +1153,43 @@ mod tests {
 
     #[test]
     fn client_gone_while_idle_keeps_idle() {
-        let mut c = Core::new(true, now());
+        let mut c = Core::new(true, false, now());
         c.client_gone(Some(now()));
         assert!(matches!(c.phase, Phase::Idle));
     }
 
     #[test]
     fn ready_only_transitions_from_booting() {
-        let mut c = Core::new(false, now());
-        assert!(c.ready());
+        let mut c = Core::new(false, false, now());
+        assert!(c.ready(false, now()));
         assert!(matches!(c.phase, Phase::Idle));
-        assert!(!c.ready(), "ready is a no-op once already ready");
+        assert!(
+            !c.ready(false, now()),
+            "ready is a no-op once already ready"
+        );
+    }
+
+    #[test]
+    fn ready_enters_warmup_when_configured() {
+        let mut c = Core::new(false, false, now());
+        assert!(c.ready(true, now()));
+        assert!(matches!(c.phase, Phase::Warmup { .. }));
+        assert!(c.is_pre_serving(), "warmup is not yet servable");
+        // clients may connect during warmup but not be served
+        assert!(c.try_accept(false).is_some());
+        assert!(matches!(c.phase, Phase::Warmup { .. }));
+        // warmup completing makes it servable
+        assert!(c.warmup_done());
+        assert!(matches!(c.phase, Phase::Idle));
+        assert!(!c.warmup_done(), "warmup_done is a no-op once past warmup");
     }
 
     #[test]
     fn begin_booting_resets_served() {
-        let mut c = Core::new(true, now());
+        let mut c = Core::new(true, false, now());
         c.try_accept(false);
         assert!(c.served);
-        c.begin_booting(false, now());
+        c.begin_booting(false, false, now());
         assert!(!c.served);
         assert!(c.is_booting());
     }

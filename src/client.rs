@@ -146,8 +146,8 @@ fn read_protocol(stream: Stream, cfg: &ClientConfig) -> AppResult<()> {
     let stdout = io::stdout();
     let stderr = io::stderr();
 
-    let mut out_scanner = scanner_for(out_markers(cfg), cfg.strip_out_marker);
-    let mut err_scanner = scanner_for(err_markers(cfg), cfg.strip_err_marker);
+    let mut out_scanner = scanner_for(out_markers(cfg), cfg.strip_marker_stdout);
+    let mut err_scanner = scanner_for(err_markers(cfg), cfg.strip_marker_stderr);
 
     loop {
         match reader.read_packet() {
@@ -294,7 +294,7 @@ fn read_raw(mut stream: Stream, cfg: &ClientConfig) -> AppResult<()> {
         return Ok(());
     }
 
-    let mut scanner = MarkerScanner::new(markers, cfg.strip_out_marker);
+    let mut scanner = MarkerScanner::new(markers, cfg.strip_marker_stdout);
     let mut buf = vec![0u8; BUF];
     loop {
         let n = stream

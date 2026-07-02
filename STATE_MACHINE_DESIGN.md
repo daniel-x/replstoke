@@ -14,7 +14,8 @@ only the control plane is consolidated.
 
 ```rust
 enum Phase {
-    Booting  { since: Instant },            // spawned, not ready; a client may be attached but its input is held
+    Booting  { since: Instant },            // spawned, not ready; a client may be attached but its input is not forwarded
+    Warmup,                                 // ready, running the one-shot --warmup-input before serving; input still not forwarded
     Idle,                                   // ready, no request in flight (client may or may not be attached)
     Busy,                                   // input forwarded, awaiting end-of-response
     Draining { deadline: Option<Instant> }, // client left mid-request, REPL still finishing
@@ -23,20 +24,23 @@ enum Phase {
 
 struct Core {                 // guarded by Mutex<Core> + Condvar
     phase: Phase,
-    client: Option<ClientConn>,   // the single active client sink (+ gen)
-    served: bool,                 // this REPL instance handled >=1 request (startup-failure accounting)
+    served: bool,                 // this REPL instance accepted >=1 client (startup-failure accounting)
     requests: u64,
     next_gen: u64,
+    req_seq: u64,                 // ++ on each Idle -> Busy; pumps reset their scanner per request
+    serving: bool,                // client's request has started and it is still attached; gates output delivery
 }
 
-// stays in its OWN Mutex, NOT in Core - blocking writes must never hold the Core lock:
+// each written with BLOCKING I/O, so each lives in its OWN Mutex, never under the Core lock:
+sink:       Mutex<Option<ClientConn>>   // the single active client's write handle (+ gen)
 repl_stdin: Mutex<Option<ChildStdin>>
 ```
 
-`client` lives *in* `Core` because the accept-gate and output-routing decisions
-must read/modify it atomically with `phase`. `repl_stdin` lives *outside* because
-it is only ever written through (a blocking `write_all` that backpressures), so
-holding the Core lock across that write would stall every transition.
+Both blocking sinks - the client socket and the REPL's stdin - live *outside*
+`Core`, because holding the Core lock across a blocking `write_all` would stall
+every transition. `Core` holds only lifecycle facts. The accept-gate takes both
+locks briefly in one order (Core -> sink); output routing reads `phase` and then
+writes the sink, never nested.
 
 **Hard rule: the Core lock is held only to read/transition/notify - never across
 socket or pipe I/O.**
@@ -46,8 +50,9 @@ socket or pipe I/O.**
 | event | raised by |
 |---|---|
 | `Accept(sink)` | acceptor - a connection passed the gate |
-| `RequestStart` | client_in - first chunk forwarded after ready |
+| `RequestStart` | client_in - first chunk forwarded after ready (`req_seq++`) |
 | `ResponseEnd` | pump - end-of-response marker seen |
+| `WarmupDone` | pump (warmup marker) or supervisor (`--warmup-wait` elapsed); ignored until the warmup input is sent |
 | `ClientGone` | client_in - client socket closed/errored |
 | `ReplReady` | pump (ready marker) or supervisor (`--ready-wait` elapsed) |
 | `ReplStuck` | supervisor - `--ready-marker-timeout` elapsed while Booting |
@@ -55,23 +60,31 @@ socket or pipe I/O.**
 | `ReplExited{stuck, forced}` | supervisor - child reaped |
 | `Shutdown` | signal flag / `-k` / fatal error |
 
+`ReplReady` targets `Warmup` when a `--warmup-input` is configured, else `Idle`. With no
+readiness mechanism the REPL starts directly in `Warmup` (if a warmup is set) or
+`Idle`, skipping `Booting`.
+
 ## Transitions
 
 Only meaningful pairs; anything omitted is a no-op in that phase.
 
 | Phase | Event | -> Phase | Actions |
 |---|---|---|---|
-| **Booting** | `Accept` | Booting | if `client==None`: store sink, `served=true`, spawn client_in; else reject |
-| | `ReplReady` | **Idle** | notify condvar (wakes a client_in parked before its read) |
+| **Booting** | `Accept` | Booting | if `sink==None`: store sink, `served=true`, spawn client_in; else reject |
+| | `ReplReady` | **Warmup** / **Idle** | Warmup if `--warmup-input` set, else Idle; notify condvar (wakes a client_in parked before its read) |
 | | `ReplStuck` | Booting¹ | `terminate()`; stamp exit `stuck` -> resolved by `ReplExited` |
-| | `ClientGone` | Booting | clear `client` (no deadline - no request was in flight) |
+| | `ClientGone` | Booting | clear `sink` (no deadline - no request was in flight) |
 | | `ReplExited` | Booting / **Stopped** | see *ReplExited* |
-| **Idle** | `Accept` | Idle | if `client==None`: store sink, `served=true`, spawn client_in; else reject |
+| **Warmup** | `Accept` | Warmup | accept, defer forwarding, exactly like Booting |
+| | `WarmupDone` | **Idle** | supervisor already sent the warmup once on entry; notify condvar |
+| | `ClientGone` | Warmup | clear `sink` |
+| | `ReplExited` | Booting / Stopped | drop `client`; see *ReplExited* |
+| **Idle** | `Accept` | Idle | if `sink==None`: store sink, `served=true`, spawn client_in; else reject |
 | | `RequestStart` | **Busy** | (framed mode only) |
 | | `ClientGone` | Idle | clear `client` |
 | | `ReplExited` | Booting / Stopped | drop `client`; see *ReplExited* |
 | **Busy** | `ResponseEnd` | **Idle** | request done |
-| | `ClientGone` | **Draining**{d} | `d = (restart_on_client_dc && timeout).then(now+timeout)`; clear sink, keep REPL reserved |
+| | `ClientGone` | **Draining**{d} | `d = response_timeout.map(now + _)`; clear sink, keep REPL reserved |
 | | `ReplExited` | Booting / Stopped | drop `client`; see *ReplExited* |
 | **Draining** | `ResponseEnd` | **Idle** | REPL finished on its own |
 | | `DrainTimeout` | Draining¹ | `terminate()`; stamp exit `forced` -> resolved by `ReplExited` |
@@ -89,7 +102,8 @@ do_restart = cfg.restart || forced
 if !do_restart                       -> Stopped        [ctl error "REPL exited"]
 startup_failure = stuck || (!served && since < GRACE)
 if ++consecutive >= MAX              -> Stopped        [ctl error "repeatedly failed to start"]
-else respawn; served=false           -> Booting{now}   [notify condvar]   (backoff first)
+else respawn; served=false           -> initial phase   [notify condvar]   (backoff first)
+                                       (Booting, else Warmup, else Idle - see initial_phase)
 ```
 
 `forced` replaces the old `force_restart`; `stuck` replaces `ready_timed_out`.
@@ -97,26 +111,41 @@ Both now have a lifetime of one exit (message payloads), not standing flags.
 
 ## Derived gates
 
-The scattered `if busy || !ready || ...` checks become predicates on `phase`:
+The scattered `if busy || !ready || ...` checks become predicates on `phase`.
+`pre_serving = matches!(phase, Booting | Warmup)`:
 
 | decision | predicate |
 |---|---|
-| accept a new client | `client.is_none() && matches!(phase, Booting \| Idle)` |
-| forward client input | wait until `!matches!(phase, Booting \| Stopped)` and `repl_stdin.is_some()`, then write |
-| route REPL output -> client | `client.is_some() && !matches!(phase, Booting)` |
-| a marker means "response done" | only acts in `Busy \| Draining` |
+| accept a new client | `sink.is_none() && matches!(phase, Booting \| Warmup \| Idle)` |
+| forward client input | wait until `!pre_serving` (and not stopping); write when `repl_stdin.is_some()` |
+| deliver REPL output to the client | whenever `serving` (the client's first request has started and it has not disconnected), across `Busy`, `Idle`, and `Draining`; boot/warmup output and any remnant seen while `!serving` goes to the server's std streams |
+| scan a response | fed only in `Busy \| Draining`, reset fresh when `req_seq` advances, so no response's held bytes bleed into the next |
+| a marker means "done" | in `Busy \| Draining` -> `ResponseEnd`; in `Warmup` -> `WarmupDone` |
+
+`serving` (a `Core` flag: set on the first `RequestStart`, cleared on `ClientGone`,
+`Accept`, and respawn) decouples output delivery from the `Busy`/`Idle` phase. The
+server's own end marker fires `ResponseEnd` (`Busy` -> `Idle`) only to decide when
+the *next* client may be served; it must not stop feeding the currently-connected
+one. Because stdout and stderr are independent pipes, a marker on one stream can be
+observed before the tail of the response is drained on the other; delivering across
+`Idle` while `serving` keeps that tail flowing to the client instead of dropping it.
+Withholding whenever `!serving` still keeps boot banners and warmup output
+race-proof (the warmup's output may be processed after the phase flips, but no
+client is being served then) and prevents one client's tail from bleeding into the
+next (its `serving` clears the instant it disconnects).
 
 ## Flag mapping
 
 | old | new |
 |---|---|
 | `busy: AtomicBool` | `phase in {Busy, Draining}` |
-| `ready: AtomicBool` | `phase not in {Booting}` |
+| `ready: AtomicBool` | `phase not in {Booting, Warmup}` (i.e. `!pre_serving`) |
 | `dc_deadline: Mutex<Option<Instant>>` | `Draining{deadline}` payload |
 | `served: AtomicBool` | `Core.served` |
 | `force_restart` (local) | `ReplExited{forced}` payload |
 | `ready_timed_out` (local) | `ReplExited{stuck}` payload |
-| `client`, `repl_stdin`, `next_gen`, `requests` | unchanged in role |
+| `client: Mutex<..>` | `sink: Mutex<..>` (separate lock; blocking writes) |
+| `repl_stdin`, `next_gen`, `requests` | unchanged in role |
 
 ## Concurrency
 

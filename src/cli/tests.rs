@@ -157,8 +157,8 @@ fn client_input_ordering_and_raw_bytes() {
     assert_eq!(c.arginput.as_deref(), Some(b"print(3*6)\n".as_slice()));
     assert_eq!(c.suffix, b"END\n");
     assert_eq!(c.end_marker_stdout, b"END");
-    assert!(!c.strip_out_marker);
-    assert!(!c.strip_err_marker);
+    assert!(!c.strip_marker_stdout);
+    assert!(!c.strip_marker_stderr);
 }
 
 #[test]
@@ -180,13 +180,13 @@ fn client_fileinput_stdin_and_path() {
 
 #[test]
 fn client_strip_marker() {
-    let c = client(&["-c", "--strip-out-marker"]);
-    assert!(c.strip_out_marker);
-    assert!(!c.strip_err_marker);
+    let c = client(&["-c", "--strip-marker-stdout"]);
+    assert!(c.strip_marker_stdout);
+    assert!(!c.strip_marker_stderr);
 
-    let c = client(&["-c", "--strip-err-marker"]);
-    assert!(!c.strip_out_marker);
-    assert!(c.strip_err_marker);
+    let c = client(&["-c", "--strip-marker-stderr"]);
+    assert!(!c.strip_marker_stdout);
+    assert!(c.strip_marker_stderr);
 }
 
 #[test]
@@ -346,20 +346,18 @@ fn invalid_timeout() {
 fn server_accepts_detection_options() {
     let s = server(&[
         "-s",
-        "--timeout=1.5",
+        "--response-timeout=1.5",
         "--end-marker-stdout=END",
         "--error-marker-stderr=ERR",
-        "--strip-out-marker",
-        "--restart-on-client-dc",
+        "--strip-marker-stdout",
         "-e",
         "python3",
     ]);
-    assert_eq!(s.timeout, Some(std::time::Duration::from_secs_f64(1.5)));
+    assert_eq!(s.response_timeout, Some(std::time::Duration::from_secs_f64(1.5)));
     assert_eq!(s.end_marker_stdout, b"END");
     assert_eq!(s.error_marker_stderr, b"ERR");
-    assert!(s.strip_out_marker);
-    assert!(!s.strip_err_marker);
-    assert!(s.restart_on_client_dc);
+    assert!(s.strip_marker_stdout);
+    assert!(!s.strip_marker_stderr);
 }
 
 #[test]
@@ -369,9 +367,8 @@ fn server_detection_defaults() {
     assert_eq!(s.error_marker_stderr, b"error");
     assert!(s.end_marker_stderr.is_empty());
     assert!(s.error_marker_stdout.is_empty());
-    assert!(!s.strip_out_marker);
-    assert!(s.timeout.is_none());
-    assert!(!s.restart_on_client_dc);
+    assert!(!s.strip_marker_stdout);
+    assert!(s.response_timeout.is_none());
 }
 
 #[test]
@@ -444,6 +441,67 @@ fn ready_marker_timeout_requires_a_marker() {
 }
 
 #[test]
+fn server_accepts_warmup() {
+    let s = server(&[
+        "-s",
+        "--warmup-input",
+        "import numpy\n",
+        "--warmup-marker-stdout",
+        "OK",
+        "--warmup-wait=2",
+        "-e",
+        "python3",
+    ]);
+    assert_eq!(s.warmup, b"import numpy\n");
+    assert_eq!(s.warmup_marker_stdout, b"OK");
+    assert_eq!(
+        s.warmup_wait,
+        Some(std::time::Duration::from_secs_f64(2.0))
+    );
+}
+
+#[test]
+fn warmup_works_with_raw() {
+    // --warmup-input is NOT prohibited with --raw.
+    let s = server(&[
+        "-s",
+        "--raw",
+        "--warmup-input",
+        "x\n",
+        "--warmup-wait=1",
+        "-e",
+        "python3",
+    ]);
+    assert!(s.raw);
+    assert_eq!(s.warmup, b"x\n");
+}
+
+#[test]
+fn warmup_requires_end_detection() {
+    let msg = err(&["-s", "--warmup-input", "x\n", "-e", "python3"]);
+    assert!(
+        msg.starts_with("--warmup-input requires a way to detect its end"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn warmup_detection_requires_warmup() {
+    assert_eq!(
+        err(&["-s", "--warmup-wait=1", "-e", "python3"]),
+        "--warmup-marker-* / --warmup-wait require --warmup-input"
+    );
+}
+
+#[test]
+fn warmup_rejected_in_client_mode() {
+    assert_eq!(
+        err(&["-c", "--warmup-input", "x\n"]),
+        "--warmup-input is not allowed when running in client mode"
+    );
+}
+
+#[test]
 fn ready_options_rejected_in_client_mode() {
     assert_eq!(
         err(&["-c", "--ready-marker-stdout=UP"]),
@@ -456,10 +514,18 @@ fn ready_options_rejected_in_client_mode() {
 }
 
 #[test]
-fn restart_on_client_dc_rejected_in_client_mode() {
+fn response_timeout_rejected_in_client_mode() {
     assert_eq!(
-        err(&["-c", "--restart-on-client-dc"]),
-        "--restart-on-client-dc is not allowed when running in client mode"
+        err(&["-c", "--response-timeout=1"]),
+        "--response-timeout is not allowed when running in client mode"
+    );
+}
+
+#[test]
+fn timeout_rejected_in_server_mode() {
+    assert_eq!(
+        err(&["-s", "--timeout=1", "-e", "python3"]),
+        "--timeout is not allowed when running in server mode"
     );
 }
 

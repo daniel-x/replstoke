@@ -24,9 +24,8 @@ struct Raw {
     server: bool,
     client: bool,
     restart: bool,
-    restart_on_client_dc: bool,
-    strip_out_marker: bool,
-    strip_err_marker: bool,
+    strip_marker_stdout: bool,
+    strip_marker_stderr: bool,
     raw: bool,
     help: bool,
     version: bool,
@@ -46,8 +45,14 @@ struct Raw {
     ready_marker_stderr: Option<Vec<u8>>,
     ready_wait: Option<Duration>,
     ready_marker_timeout: Option<Duration>,
+    warmup: Option<Vec<u8>>,
+    warmup_marker_stdout: Option<Vec<u8>>,
+    warmup_marker_stderr: Option<Vec<u8>>,
+    warmup_wait: Option<Duration>,
+    warmup_marker_timeout: Option<Duration>,
     ctl: Option<String>,
     timeout: Option<Duration>,
+    response_timeout: Option<Duration>,
     exec: Option<Vec<OsString>>,
 }
 
@@ -165,17 +170,13 @@ fn handle_long(
             no_value(&value)?;
             raw.restart = true;
         }
-        "restart-on-client-dc" => {
+        "strip-marker-stdout" => {
             no_value(&value)?;
-            raw.restart_on_client_dc = true;
+            raw.strip_marker_stdout = true;
         }
-        "strip-out-marker" => {
+        "strip-marker-stderr" => {
             no_value(&value)?;
-            raw.strip_out_marker = true;
-        }
-        "strip-err-marker" => {
-            no_value(&value)?;
-            raw.strip_err_marker = true;
+            raw.strip_marker_stderr = true;
         }
         "raw" => {
             no_value(&value)?;
@@ -206,8 +207,16 @@ fn handle_long(
         "ready-marker-timeout" => {
             raw.ready_marker_timeout = Some(parse_timeout(&required(value, i)?)?)
         }
+        "warmup-input" => raw.warmup = Some(required(value, i)?),
+        "warmup-marker-stdout" => raw.warmup_marker_stdout = Some(required(value, i)?),
+        "warmup-marker-stderr" => raw.warmup_marker_stderr = Some(required(value, i)?),
+        "warmup-wait" => raw.warmup_wait = Some(parse_timeout(&required(value, i)?)?),
+        "warmup-marker-timeout" => {
+            raw.warmup_marker_timeout = Some(parse_timeout(&required(value, i)?)?)
+        }
         "ctl" => raw.ctl = Some(bytes_to_string(required(value, i)?)),
         "timeout" => raw.timeout = Some(parse_timeout(&required(value, i)?)?),
+        "response-timeout" => raw.response_timeout = Some(parse_timeout(&required(value, i)?)?),
         "fileinput" => raw.fileinput = Some(os_from_bytes(required(value, i)?)),
         "exec" => {
             let mut argv = Vec::new();
@@ -424,6 +433,9 @@ fn build_server(raw: Raw) -> AppResult<Config> {
     if raw.kill.is_some() {
         return Err(not_allowed("--kill", "server"));
     }
+    if raw.timeout.is_some() {
+        return Err(not_allowed("--timeout", "server"));
+    }
 
     let bind = resolve_bind(&raw)?;
 
@@ -450,6 +462,27 @@ fn build_server(raw: Raw) -> AppResult<Config> {
             "--ready-marker-timeout requires --ready-marker-stdout or --ready-marker-stderr",
         ));
     }
+    let warmup = raw.warmup.unwrap_or_default();
+    let warmup_marker_stdout = raw.warmup_marker_stdout.unwrap_or_default();
+    let warmup_marker_stderr = raw.warmup_marker_stderr.unwrap_or_default();
+    let has_warmup_marker = !warmup_marker_stdout.is_empty() || !warmup_marker_stderr.is_empty();
+    let has_warmup_end = has_warmup_marker || raw.warmup_wait.is_some();
+    if !warmup.is_empty() && !has_warmup_end {
+        return Err(AppError::usage(
+            "--warmup-input requires a way to detect its end \
+             (--warmup-marker-stdout/--warmup-marker-stderr or --warmup-wait)",
+        ));
+    }
+    if warmup.is_empty() && has_warmup_end {
+        return Err(AppError::usage(
+            "--warmup-marker-* / --warmup-wait require --warmup-input",
+        ));
+    }
+    if raw.warmup_marker_timeout.is_some() && !has_warmup_marker {
+        return Err(AppError::usage(
+            "--warmup-marker-timeout requires --warmup-marker-stdout or --warmup-marker-stderr",
+        ));
+    }
 
     Ok(Config::Server(ServerConfig {
         repl_argv,
@@ -465,14 +498,18 @@ fn build_server(raw: Raw) -> AppResult<Config> {
         error_marker_stderr: raw
             .error_marker_stderr
             .unwrap_or_else(default_error_marker_stderr),
-        strip_out_marker: raw.strip_out_marker,
-        strip_err_marker: raw.strip_err_marker,
+        strip_marker_stdout: raw.strip_marker_stdout,
+        strip_marker_stderr: raw.strip_marker_stderr,
         ready_marker_stdout,
         ready_marker_stderr,
         ready_wait: raw.ready_wait,
         ready_marker_timeout: raw.ready_marker_timeout,
-        timeout: raw.timeout,
-        restart_on_client_dc: raw.restart_on_client_dc,
+        warmup,
+        warmup_marker_stdout,
+        warmup_marker_stderr,
+        warmup_wait: raw.warmup_wait,
+        warmup_marker_timeout: raw.warmup_marker_timeout,
+        response_timeout: raw.response_timeout,
     }))
 }
 
@@ -483,8 +520,8 @@ fn build_client(raw: Raw) -> AppResult<Config> {
     if raw.restart {
         return Err(not_allowed("--restart", "client"));
     }
-    if raw.restart_on_client_dc {
-        return Err(not_allowed("--restart-on-client-dc", "client"));
+    if raw.response_timeout.is_some() {
+        return Err(not_allowed("--response-timeout", "client"));
     }
     if raw.ready_marker_stdout.is_some() {
         return Err(not_allowed("--ready-marker-stdout", "client"));
@@ -497,6 +534,21 @@ fn build_client(raw: Raw) -> AppResult<Config> {
     }
     if raw.ready_marker_timeout.is_some() {
         return Err(not_allowed("--ready-marker-timeout", "client"));
+    }
+    if raw.warmup.is_some() {
+        return Err(not_allowed("--warmup-input", "client"));
+    }
+    if raw.warmup_marker_stdout.is_some() {
+        return Err(not_allowed("--warmup-marker-stdout", "client"));
+    }
+    if raw.warmup_marker_stderr.is_some() {
+        return Err(not_allowed("--warmup-marker-stderr", "client"));
+    }
+    if raw.warmup_wait.is_some() {
+        return Err(not_allowed("--warmup-wait", "client"));
+    }
+    if raw.warmup_marker_timeout.is_some() {
+        return Err(not_allowed("--warmup-marker-timeout", "client"));
     }
     if raw.pidfile.is_some() {
         return Err(not_allowed("--pidfile", "client"));
@@ -539,8 +591,8 @@ fn build_client(raw: Raw) -> AppResult<Config> {
         error_marker_stderr: raw
             .error_marker_stderr
             .unwrap_or_else(default_error_marker_stderr),
-        strip_out_marker: raw.strip_out_marker,
-        strip_err_marker: raw.strip_err_marker,
+        strip_marker_stdout: raw.strip_marker_stdout,
+        strip_marker_stderr: raw.strip_marker_stderr,
         ctl,
         raw: raw.raw,
         timeout: raw.timeout,
@@ -554,7 +606,6 @@ fn build_general(raw: Raw) -> AppResult<Config> {
         (raw.unixsocket.is_some(), "-u"),
         (raw.exec.is_some(), "-e"),
         (raw.restart, "--restart"),
-        (raw.restart_on_client_dc, "--restart-on-client-dc"),
         (raw.raw, "--raw"),
         (raw.pidfile.is_some(), "--pidfile"),
         (raw.arginput.is_some(), "--arginput"),
@@ -568,10 +619,25 @@ fn build_general(raw: Raw) -> AppResult<Config> {
         (raw.ready_marker_stderr.is_some(), "--ready-marker-stderr"),
         (raw.ready_wait.is_some(), "--ready-wait"),
         (raw.ready_marker_timeout.is_some(), "--ready-marker-timeout"),
+        (raw.warmup.is_some(), "--warmup-input"),
+        (
+            raw.warmup_marker_stdout.is_some(),
+            "--warmup-marker-stdout",
+        ),
+        (
+            raw.warmup_marker_stderr.is_some(),
+            "--warmup-marker-stderr",
+        ),
+        (raw.warmup_wait.is_some(), "--warmup-wait"),
+        (
+            raw.warmup_marker_timeout.is_some(),
+            "--warmup-marker-timeout",
+        ),
         (raw.ctl.is_some(), "--ctl"),
         (raw.timeout.is_some(), "--timeout"),
-        (raw.strip_out_marker, "--strip-out-marker"),
-        (raw.strip_err_marker, "--strip-err-marker"),
+        (raw.response_timeout.is_some(), "--response-timeout"),
+        (raw.strip_marker_stdout, "--strip-marker-stdout"),
+        (raw.strip_marker_stderr, "--strip-marker-stderr"),
     ];
     for (present, opt) in forbidden {
         if present {
