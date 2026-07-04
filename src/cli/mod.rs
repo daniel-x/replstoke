@@ -620,14 +620,8 @@ fn build_general(raw: Raw) -> AppResult<Config> {
         (raw.ready_wait.is_some(), "--ready-wait"),
         (raw.ready_marker_timeout.is_some(), "--ready-marker-timeout"),
         (raw.warmup.is_some(), "--warmup-input"),
-        (
-            raw.warmup_marker_stdout.is_some(),
-            "--warmup-marker-stdout",
-        ),
-        (
-            raw.warmup_marker_stderr.is_some(),
-            "--warmup-marker-stderr",
-        ),
+        (raw.warmup_marker_stdout.is_some(), "--warmup-marker-stdout"),
+        (raw.warmup_marker_stderr.is_some(), "--warmup-marker-stderr"),
         (raw.warmup_wait.is_some(), "--warmup-wait"),
         (
             raw.warmup_marker_timeout.is_some(),

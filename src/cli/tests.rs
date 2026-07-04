@@ -353,7 +353,10 @@ fn server_accepts_detection_options() {
         "-e",
         "python3",
     ]);
-    assert_eq!(s.response_timeout, Some(std::time::Duration::from_secs_f64(1.5)));
+    assert_eq!(
+        s.response_timeout,
+        Some(std::time::Duration::from_secs_f64(1.5))
+    );
     assert_eq!(s.end_marker_stdout, b"END");
     assert_eq!(s.error_marker_stderr, b"ERR");
     assert!(s.strip_marker_stdout);
@@ -454,10 +457,7 @@ fn server_accepts_warmup() {
     ]);
     assert_eq!(s.warmup, b"import numpy\n");
     assert_eq!(s.warmup_marker_stdout, b"OK");
-    assert_eq!(
-        s.warmup_wait,
-        Some(std::time::Duration::from_secs_f64(2.0))
-    );
+    assert_eq!(s.warmup_wait, Some(std::time::Duration::from_secs_f64(2.0)));
 }
 
 #[test]

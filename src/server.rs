@@ -604,7 +604,7 @@ pub fn run(cfg: ServerConfig) -> AppResult<()> {
             Phase::Warmup { since } => {
                 if !shared.warmup_is_sent() {
                     shared.send_warmup();
-                } else if cfg.warmup_wait.map_or(false, |t| since.elapsed() >= t) {
+                } else if cfg.warmup_wait.is_some_and(|t| since.elapsed() >= t) {
                     shared.warmup_done();
                 } else if let Some(t) = cfg.warmup_marker_timeout {
                     if !stuck && since.elapsed() >= t {

@@ -67,6 +67,9 @@ fn discover_distinguishes_socket_from_pidfile_by_suffix() {
     let sock = discover_one_in(&dir, NAME_PREFIX, SOCKET_SUFFIX, "socket").unwrap();
     assert_eq!(sock.file_name().unwrap(), ".replstoke_pid1_python3_socket");
     let pidfile = discover_one_in(&dir, NAME_PREFIX, PIDFILE_SUFFIX, "pidfile").unwrap();
-    assert_eq!(pidfile.file_name().unwrap(), ".replstoke_pid1_python3_pidfile");
+    assert_eq!(
+        pidfile.file_name().unwrap(),
+        ".replstoke_pid1_python3_pidfile"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
