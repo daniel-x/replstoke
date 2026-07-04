@@ -3,7 +3,7 @@ name = "replstoke"
 version = "0.2.0"
 edition = "2021"
 description = "Wrap a long-running REPL and make it accessible as a one-shot (batch) tool."
-license = "MIT"
+license = "Apache-2.0"
 readme = "README.md"
 
 [lib]
