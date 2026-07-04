@@ -14,9 +14,8 @@ replstoke --server -d -u -e /usr/bin/python3 -i -u
 ```
 
 ```sh
-# 2. connect with a client to the repl (prints 18). the trailing blank line from
-#    print() is the default end-of-response marker:
-replstoke --client -u --strip-marker-stdout -i $'print(3*6)\nprint()\n'
+# 2. connect with a client to the repl:
+replstoke --client --strip-marker-stdout -i $'print(3*6)\nprint()\n'
 ```
 
 ## Details
