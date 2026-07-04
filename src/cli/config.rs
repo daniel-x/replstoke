@@ -8,10 +8,13 @@ use std::time::Duration;
 pub const DEFAULT_ADDR: &str = "127.0.0.1";
 /// Default TCP port.
 pub const DEFAULT_PORT: u16 = 44556;
-/// Prefix of default / discoverable unix socket files.
-pub const SOCKET_PREFIX: &str = ".replstoke_socket_";
-/// Prefix of default / discoverable pid files.
-pub const PIDFILE_PREFIX: &str = ".replstoke_process_id_";
+/// Common prefix of default / discoverable socket and pidfile names, which have
+/// the form `.replstoke_pid<pid>_<cmdname>_<socket|pidfile>`.
+pub const NAME_PREFIX: &str = ".replstoke_pid";
+/// Suffix distinguishing a socket file from a pidfile.
+pub const SOCKET_SUFFIX: &str = "_socket";
+/// Suffix distinguishing a pidfile from a socket file.
+pub const PIDFILE_SUFFIX: &str = "_pidfile";
 
 /// Top-level mode of operation.
 #[derive(Debug)]
@@ -37,7 +40,7 @@ pub enum Bind {
 /// How a pidfile path is determined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PidfileSpec {
-    /// Use the default `./.replstoke_process_id_<cmdname>_pid<pid>` name.
+    /// Use the default `./.replstoke_pid<pid>_<cmdname>_pidfile` name.
     Default,
     /// Use an explicit path.
     Path(PathBuf),

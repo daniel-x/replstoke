@@ -166,7 +166,7 @@ Shared by both modes:
 - `-p, --port=PORT` - TCP port (only with `-a`). Default `44556`.
 - `-u, --unixsocket[=PATH]` - unix socket. As a server, a default path is used if
   `PATH` is omitted; as a client, a bare `-u` discovers a single
-  `./.replstoke_socket_*` and connects to it (error if zero or many exist).
+  `./.replstoke_pid*_socket` and connects to it (error if zero or many exist).
 
 `-a` and `-u` are mutually exclusive. Unix sockets are first-class on Linux/macOS;
 on Windows the portable default is TCP.
@@ -176,7 +176,7 @@ on Windows the portable default is TCP.
 - `-k, --kill[=PIDFILE]` - terminate a previously started server via its pidfile
   (SIGTERM then SIGKILL after a timeout; `CTRL_BREAK_EVENT` then
   `TerminateProcess` on Windows). With no value, a single
-  `./.replstoke_process_id_*` is discovered. Stale pidfiles are removed.
+  `./.replstoke_pid*_pidfile` is discovered. Stale pidfiles are removed.
 - `-h, --help`, `--version`.
 
 ## End-of-response detection

@@ -102,7 +102,7 @@ Server mode options:
   -u, --unixsocket[=SOCKPATH]   bind to (listen on) the unix socket at the
                                 specified path and listen for incoming
                                 connections;
-                                default: ./.replstoke_socket_<cmdname>_pid<pid>
+                                default: ./.replstoke_pid<pid>_<cmdname>_socket
                                 (<pid> = process id, the id of the own process,
                                 i.e. the replstoke server process). <cmdname> is
                                 the filename (without the path) of the REPL
@@ -117,7 +117,7 @@ Server mode options:
                                 value is given, then the default pidfile is
                                 used.
                                 default:
-                                ./.replstoke_process_id_<cmdname>_pid<pid>
+                                ./.replstoke_pid<pid>_<cmdname>_pidfile
                                 <cmdname> is the filename (without the path) of
                                 the REPL executable.
       --raw                     disable the framed protocol and behave like a
@@ -190,7 +190,7 @@ Client mode options:
                                 default: 44556
   -u, --unixsocket[=SOCKPATH]   connect to the unix socket at the specified
                                 path; behavior when SOCKPATH is omitted: look
-                                for sockets named ./.replstoke_socket_* . if
+                                for sockets named ./.replstoke_pid*_socket . if
                                 exactly one exists, connect to it. if multiple
                                 exist, print an error and exit.
                                 only one of -u and -a are allowed at the same
@@ -248,7 +248,7 @@ General mode options:
                                 has its pid (process id) written to the
                                 specified file;
                                 if the PIDFILE is omitted, pid files matching
-                                the format ./.replstoke_process_id_* are searched
+                                the format ./.replstoke_pid*_pidfile are searched
                                 for. if there is exactly one such file, the
                                 process belonging to it is terminated.
                                 termination is done in this manner:

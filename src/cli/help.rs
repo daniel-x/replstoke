@@ -43,7 +43,7 @@ Server mode (-s, --server):
 
 Client mode (-c, --client):
   -a/-p/-u                    where to connect (see server, bare -u discovers
-                              a single ./.replstoke_socket_* )
+                              a single ./.replstoke_pid*_socket )
   -i, --arginput=DATA         input sent to the REPL
   -f, --fileinput=PATH        input streamed from PATH after -i ( - is stdin)
   -x, --suffix=DATA           sent after the input
@@ -65,7 +65,7 @@ Client mode (-c, --client):
 
 General:
   -k, --kill[=PIDFILE]        terminate a server by its pidfile (discovers a
-                              single ./.replstoke_process_id_* if omitted)
+                              single ./.replstoke_pid*_pidfile if omitted)
   -h, --help                  show this help
       --version               show version
 

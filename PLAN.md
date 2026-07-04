@@ -152,14 +152,14 @@ multiple partial-then-fail prefixes, marker at EOF, empty marker disallowed.
 ## 6. Names & discovery (`names.rs`)
 
 - `<cmdname>` = file name of `repl_argv[0]` without directory.
-- Default socket: `./.replstoke_socket_<cmdname>_pid<pid>` (`pid` = own pid via
+- Default socket: `./.replstoke_pid<pid>_<cmdname>_socket` (`pid` = own pid via
   `std::process::id()`).
-- Default pidfile: `./.replstoke_process_id_<cmdname>_pid<pid>`.
-- Client unix discovery: glob `./.replstoke_socket_*` ourselves (read the current
-  dir, match prefix); exactly one → use it, zero/many → error.
-- Kill discovery: glob `./.replstoke_process_id_*`; exactly one → use it, many → error.
+- Default pidfile: `./.replstoke_pid<pid>_<cmdname>_pidfile`.
+- Client unix discovery: glob `./.replstoke_pid*_socket` ourselves (read the current
+  dir, match prefix + suffix); exactly one → use it, zero/many → error.
+- Kill discovery: glob `./.replstoke_pid*_pidfile`; exactly one → use it, many → error.
 
-(Globbing is a manual `read_dir` + prefix match — no glob crate.)
+(Globbing is a manual `read_dir` + prefix/suffix match — no glob crate.)
 
 ## 7. Transport (`transport.rs`)
 
@@ -275,7 +275,7 @@ mid-input).
 
 - `--help` → print the help text (same content as the spec Synopsis), exit 0.
 - `--version` → print `replstoke 0.1.0`, exit 0.
-- `--kill` → resolve pidfile (explicit or discover single `./.replstoke_process_id_*`;
+- `--kill` → resolve pidfile (explicit or discover single `./.replstoke_pid*_pidfile`;
   many → error), read pid, then `platform::terminate(pid, timeout)`:
   - **Unix:** `kill(pid, SIGTERM)`; poll liveness with `kill(pid, 0)` up to the
     timeout; if still alive `kill(pid, SIGKILL)`.
