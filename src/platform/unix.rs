@@ -132,9 +132,11 @@ pub fn terminate_pid(pid: u32, timeout: Duration) -> bool {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    unsafe {
-        kill(pid_i, SIGKILL);
-    }
-    thread::sleep(Duration::from_millis(50));
-    !is_alive(pid)
+    // Grace expired: force-kill. SIGKILL cannot be caught or ignored, so once it
+    // is delivered the process is terminated. It may briefly remain an unreaped
+    // zombie, which on macOS/BSD still answers `kill(pid, 0)` as "alive" (Linux's
+    // `is_alive` filters zombies via /proc), so treat a delivered SIGKILL as
+    // termination rather than requiring `is_alive` to report it gone.
+    let delivered = unsafe { kill(pid_i, SIGKILL) } == 0;
+    delivered || !is_alive(pid)
 }
