@@ -55,10 +55,22 @@ impl Listener {
     }
 
     pub fn accept(&self) -> io::Result<Stream> {
+        // The listener is non-blocking so the accept loop can poll. On BSD/macOS
+        // the accepted socket inherits that flag, but the per-connection code uses
+        // blocking reads/writes, so reset each accepted socket to blocking (a no-op
+        // on Linux, where the flag is not inherited).
         match self {
-            Listener::Tcp(l) => l.accept().map(|(s, _)| Stream::Tcp(s)),
+            Listener::Tcp(l) => {
+                let (s, _) = l.accept()?;
+                s.set_nonblocking(false)?;
+                Ok(Stream::Tcp(s))
+            }
             #[cfg(unix)]
-            Listener::Unix(l) => l.accept().map(|(s, _)| Stream::Unix(s)),
+            Listener::Unix(l) => {
+                let (s, _) = l.accept()?;
+                s.set_nonblocking(false)?;
+                Ok(Stream::Unix(s))
+            }
         }
     }
 
